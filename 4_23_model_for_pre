@@ -1,0 +1,197 @@
+library(tidyverse)
+library(readxl)
+library(plm)
+library(lmtest)
+library(sandwich)
+library(dplyr)
+library(car)
+library(mediation)
+library(corrplot)
+
+
+data_raw <- read_excel("C:\\Users\\Steve\\Desktop\\4_3_data.xlsx")
+
+
+#宽转长
+data_long <- data_raw %>%
+  pivot_longer(cols = -c(code, name, field, nature, fcode, regis_place), 
+               names_to = c(".value", "year"),
+               names_pattern = "([a-zA-Z_]+)(\\d{4})") %>% 
+  mutate(
+    ln_size = log((size / 1e8) + 1), 
+    ln_mc = log((mc / 1e8) + 1),
+    ln_shares = log((shares / 1e8) + 1),
+    ESG = case_when(
+      ESG == "AAA" ~ 97.5, ESG == "AA" ~ 92.5, ESG == "A" ~ 87.5,
+      ESG == "BBB" ~ 82.5, ESG == "BB" ~ 77.5, ESG == "B" ~ 72.5,
+      ESG == "CCC" ~ 67.5, ESG == "CC" ~ 62.5, ESG == "C" ~ 30,
+      TRUE ~ NA_real_
+    )
+  ) %>% 
+  mutate(ESG = as.numeric(ESG), year = as.factor(year))
+
+
+#处理na
+data_long_clean <- data_long %>%
+  filter(!is.na(ESG) & !is.na(ln_size) & !is.na(ROA) & !is.na(leverage) & !is.na(tobinq))
+
+
+# Winsorization
+winsorization <- function(x, p = 0.01) {
+  q <- 1 - p
+  lower <- quantile(x, probs = p, na.rm = TRUE)
+  upper <- quantile(x, probs = q, na.rm = TRUE)
+  x <- ifelse(x < lower, lower, x) 
+  x <- ifelse(x > upper, upper, x) 
+  return(x) 
+}
+
+
+winsor_vars <- c("ln_size", "ln_mc", "tobinq", "CR", "ins_hold")
+
+data_long_clean <- data_long_clean %>% 
+  mutate(across(all_of(winsor_vars), winsorization))
+
+#生成滞后变量
+data_long_clean <- data_long_clean %>%
+  group_by(code) %>%
+  arrange(year) %>% 
+  mutate(
+    ESG_lag = lag(ESG), ln_size_lag = lag(ln_size), ROE_lag = lag(ROE),
+    leverage_lag = lag(leverage),
+    tobinq_lag = lag(tobinq), CR_lag = lag(CR),
+    ins_hold_lag = lag(ins_hold), 
+    ln_shares_lag = lag(ln_shares)
+  ) %>% ungroup()
+
+
+# 交互项
+data_long_clean <- data_long_clean %>%
+  mutate(nature_soe = case_when(
+    nature %in% c("央企国资控股", "省属国资控股", "地市国资控股", "其他国有") ~ "国企",
+    nature == "外资企业" ~ "外资",
+    TRUE ~ "民企"
+  )) %>% mutate(nature_soe = factor(nature_soe, levels = c("国企", "外资", "民企")))
+
+
+data_long_clean <- data_long_clean %>%
+  mutate(nature_typ = case_when( nature == "外资企业" ~ "外资", TRUE ~ "内资" )) %>% 
+  mutate(nature_typ = factor(nature_typ, levels = c("内资", "外资")))
+
+
+heavy_pollution_codes <- c("B06", "B07", "B08", "B09", "C17", "C19", "C22", "C25","C26", 
+                           "C27", "C28", "C30", "C31", "C32", "C33", "D44")
+
+data_long_clean <- data_long_clean %>%
+  mutate(field_id = if_else(fcode %in% heavy_pollution_codes, 1L, 0L)) %>%
+  mutate(field_id = factor(field_id, levels = c(0, 1), labels = c("非重污染", "重污染")))
+
+
+model_soe <- plm( ln_mc ~ ESG_lag * nature_typ + ln_size_lag + ROE_lag + leverage_lag +
+                    tobinq_lag + CR_lag + field_id,
+                  data = data_long_clean,
+                  index = c("code", "year"),
+                  model = "within",
+                  effect = "twoways")
+summary(model_soe)
+
+
+# 基础回归
+#固定效应
+model_fe3 <- plm(ln_mc ~ ESG_lag + ln_size_lag + ROE_lag + leverage_lag +
+                   tobinq_lag + CR_lag + factor(year), 
+                 data = data_long_clean, index = c("code", "year"), model = "within")
+
+summary(model_fe3)
+
+
+#vif多重共线性
+vif(lm(ln_mc ~ ESG_lag + ln_size_lag + ROE_lag + leverage_lag + tobinq_lag 
+       + CR_lag + factor(year), data = data_long_clean))
+
+
+corrplot(cor(data_long_clean[, c("ln_mc", "ESG_lag", "ln_size_lag", "ROE_lag", 
+                                 "leverage_lag", "tobinq_lag", "CR_lag")], use = "complete.obs"), 
+         method = "color", addCoef.col = "black")
+
+high_pollution_codes <- c("B06", "B07", "B08", "B09", "C17", "C19", "C22", "C25", "C26",
+                          "C27", "C28", "C30", "C31", "C32", "C33", "D44")
+
+
+esg_avg_pre <- data_long_clean %>%
+  filter(year %in% c(2014, 2015)) %>% group_by(code) %>% summarise(
+    esg_avg = mean(ESG, na.rm = TRUE),
+    .groups = "drop")
+
+qua_high <- quantile(esg_avg_pre$esg_avg, probs = 0.66, na.rm = TRUE)
+qua_low <- quantile(esg_avg_pre$esg_avg, probs = 0.33, na.rm = TRUE)
+
+
+esg_avg_pre <- esg_avg_pre %>%
+  mutate(Treat = case_when( esg_avg <= qua_low ~ 1, esg_avg >= qua_high ~ 0, 
+                            TRUE ~ NA_real_ )) %>% drop_na(Treat) 
+
+data_long_clean <- data_long_clean %>% left_join(esg_avg_pre %>% 
+                                                   dplyr::select(code, Treat), by = "code") %>%
+  filter(!is.na(Treat))
+
+data_long_clean <- data_long_clean %>%
+  mutate(
+    year = as.numeric(as.character(year)),
+    yeargp = case_when( year <= 2015 ~ "pre", year >=2016 ~ "post"),
+    Post = ifelse(yeargp == "post", 1, 0),
+    DID = Treat * Post) %>%
+  group_by(code) %>% arrange(year) %>%
+  mutate(
+    DID_lag = lag(DID),
+    Treat_lag = lag(Treat),
+    Post_lag = lag(Post)) %>% ungroup()
+
+
+#DID mc
+did1 <- plm(ln_mc ~ DID + Treat + Post + ln_size + ln_shares + ROE + leverage + 
+              tobinq + CR + factor(year), 
+            data = data_long_clean, index = c("code", "year"), 
+            model = "within", effect = "twoways")
+
+summary(did1)
+
+
+data_esg_growth <- data_long_clean %>%filter(year %in% 2016:2018) %>%
+  mutate( year_num = year - 2016, Treat_group = ifelse(Treat == 1, "low_group", "high_group"))
+
+#model_growth <- lm(ESG ~ year_num * Treat, data = data_esg_growth)
+
+
+#DID esg
+did2 <- plm(ESG ~ DID + Treat + Post, 
+            data = data_long_clean, index = c("code", "year"), 
+            model = "within", effect = "twoways")
+
+summary(did2)
+
+
+library(dplyr)
+library(ggplot2)
+esg_change <- data_long_clean %>% filter(year >= 2014 & year <= 2018) %>%
+  mutate( ESG_group = ifelse(Treat == 1, "ESG_low", "ESG_high")) %>%
+  group_by(year, ESG_group) %>%
+  summarise(
+    ESG_ave = mean(ESG, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+esg_change <- esg_change %>% drop_na()
+
+
+ggplot(esg_change, aes(x = year, y = ESG_ave, color = ESG_group)) + 
+  geom_point() +
+  geom_line() +
+  geom_vline(xintercept = 2016, linetype = "dashed") +
+  labs(
+    title = "Trend of ESG score changes in A-share Market from 2014 to 2018",
+    subtitle = "grouped by ESG scores from 2014 to 2015",
+    x = "Year",
+    y = "ESG average score",
+    color = "ESG groups") +
+  scale_x_continuous(breaks = 2014:2018) +theme_minimal(base_size = 11)
